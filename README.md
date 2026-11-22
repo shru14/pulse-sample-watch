@@ -4,9 +4,9 @@ A made-up repository for the Pulse Watch sample. It stands for the code of a sam
 record client calls, get a written summary and send a follow-up email. There is no real firm and no real system
 behind it.
 
-Pulse Watch reads this repository through Connect GitHub, as it would a client's: package lists, config files and
-the model names in the code, by file and line, in the reader's browser. From them it lists the firm's AI vendors
-and the models with a shutdown date.
+Pulse Watch reads this repository as it would a client's. Its stack scan (stack_scan.py) lists the packages and
+the model names in the code, by file and line, and the Pulse Watch sample shows the result:
+https://projectaipulse.com/planner/samples/watch/
 
-Try it: open https://projectaipulse.com/planner/vendor-watch/, choose Connect GitHub and enter
-`shru14/pulse-sample-watch`.
+To try it yourself, open https://projectaipulse.com/planner/vendor-watch/, choose Connect GitHub and enter
+`shru14/pulse-sample-watch`. In the browser it reads the package lists, so it finds the firm's AI vendors.
