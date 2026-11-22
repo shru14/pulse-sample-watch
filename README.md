@@ -9,4 +9,5 @@ the model names in the code, by file and line, and the Pulse Watch sample shows 
 https://projectaipulse.com/planner/samples/watch/
 
 To try it yourself, open https://projectaipulse.com/planner/vendor-watch/, choose Connect GitHub and enter
-`shru14/pulse-sample-watch`. In the browser it reads the package lists, so it finds the firm's AI vendors.
+`shru14/pulse-sample-watch`. It reads the newest weekly scan (stack.json on the pulse-stack branch, kept by
+.github/workflows/pulse-stack.yml every Monday), so it finds the firm's AI vendors and the models its code calls.
