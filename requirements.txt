@@ -1,0 +1,14 @@
+# adviser call notes service
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.9.2
+sqlalchemy==2.0.35
+psycopg[binary]==3.2.3
+openai==1.52.0
+anthropic==0.39.0
+mistralai==1.2.3
+google-genai==0.3.0
+azure-search-documents==11.5.1
+azure-identity==1.18.0
+langfuse==2.53.3
+pytest==8.3.3
