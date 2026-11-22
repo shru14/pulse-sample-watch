@@ -1,0 +1,1185 @@
+# Pulse Pro Engine: scans this repository's tech stack every Monday, and checks each pull request for a stack change.
+# Save this file as .github/workflows/pulse-stack.yml and commit it.
+# It runs on your own GitHub account, reads package names, versions and model names (never your code or secrets),
+# and keeps the result, stack.json, on a branch of its own: pulse-stack. Nothing is sent to Pulse Pro Engine.
+# On a pull request it compares the stack with the base branch and comments what was swapped, added or removed:
+# a model, an AI framework, a vector store, a database or a cloud region, with the file and line.
+# When the Monday scan finds a change, it opens one issue here (a later change is a comment on it), which Jira or
+# ServiceNow can pick up through their own GitHub links, and keeps changes.jsonl beside stack.json for log tools.
+# Each change is also added to record.jsonl on that branch, one line each and never rewritten. Each line holds the
+# fingerprint of the line before, so an edited line shows. Check the file at projectaipulse.com/pulse-pro/check/.
+# With a policy file from the Pulse Risk Monitor at .github/pulse-policy.json, each pull request is also checked against it:
+# mode "warn" only reports; mode "block" fails the check on a model past its maker's shutdown date or a part with a
+# government order, ban or fine. Make the check required in your branch rules if a failure should stop the merge.
+# With a Pulse Compass plan file at .github/compass-plan.json (Save plan file, on the report), each run also says which models
+# in the code the plan doesn't cover, whether the plan's picks are in the code, and which trial kit files are here.
+# That part only reports: it never fails the check.
+# On a Pulse Pro Engine page, Connect GitHub then reads the newest scan. Run it now from the Actions tab: Run workflow.
+name: Pulse Pro Engine stack scan
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+concurrency: pulse-stack-${{ github.event.pull_request.number || 'main' }}
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Scan the repository
+        env:
+          PULSE_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          cat > "$RUNNER_TEMP/stack_scan.py" <<'PULSE_SCAN'
+          #!/usr/bin/env python3
+          """Pulse Pro Engine stack scan: lists what your repository is built from, for Pulse Compass, Risk Monitor and Watch.
+
+              python stack_scan.py [folder] [--audit] [--out stack.json] [--since old-stack.json [--report change.md] [--events changes.jsonl]
+                                   [--record record.jsonl]]
+              python stack_scan.py --check record.jsonl
+
+          What it reads, in the folder you give (default: this one) and below it:
+            package lists     package.json, requirements*.txt, pyproject.toml, Pipfile
+            containers        Dockerfile*, docker-compose*.yml, compose*.yml
+            infrastructure    *.tf (providers and cloud regions)
+            code              model names written in .py, .js, .ts, .java, .go, .cs, .ipynb, .yaml and .json files
+
+          What it writes: stack.json, holding package names and versions, container images, cloud providers and regions, the
+          model names it found, the answers the code supports for the Risk Monitor's questions (personal data fields, training,
+          explanations, a chatbot, a phone app, log retention, the kind of job), each tool an AI agent may call with what its
+          own lines can do (move money, change records, send messages, call the web, run commands, write files), the names
+          of the keys it reads and whether a person approves inside it, and the file and line each came from. It never copies your code, keys or settings, and it skips
+          .env files, key files, node_modules, virtual environments and .git. Open stack.json and read it before you share it.
+
+          What it needs: Python 3.8 or later and nothing else. It makes no network connection.
+
+          --since compares with an earlier stack.json and adds what changed: a model, framework, vector store or other part
+          taken out and another put in (a swap), parts added or removed, and new versions, each with its file and line.
+          --policy checks the scan against a policy file from the Pulse Risk Monitor (.github/pulse-policy.json) and adds
+          what it names to the note: a model past its maker's shutdown date, or a part with a government order, ban or fine.
+          --plan checks the scan against a Pulse Compass plan file (.github/compass-plan.json, saved from the report) and adds
+          to the note: a model in the code the plan doesn't cover, a model the plan picked that is in the code, not in it or
+          taken out since the last scan, and the files of the plan's trial kit found here. It only reports; it never fails.
+          --report writes that change as a short note; --events writes it as one JSON line per change, for a log or
+          security tool.
+          --record adds the same lines to a record file that is only ever added to. Each line holds the fingerprint (SHA-256)
+          of the line before it, so editing an old line breaks the chain. --check reads a record file and says whether the
+          chain is unbroken, or where it breaks; the page at projectaipulse.com/pulse-pro/check/ does the same in your browser.
+
+          --audit adds the results of your own audit tools where they are installed (npm audit, pip-audit). Those tools are
+          yours and contact their own registries from your machine; this script only reads their output. Leave it off and
+          nothing but your files is read.
+
+          Kept by Pulse Pro Engine (projectaipulse.com). You may run and share this file inside your firm.
+          """
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from datetime import date
+
+          VERSION = "1"
+          SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "env", "__pycache__", ".tox", ".mypy_cache", "dist", "build",
+                       ".next", "vendor", "site-packages", ".terraform"}
+          # 22 Nov 2026, tested on real public repositories: tests, docs and examples are not the product (a model name in a test,
+          # a word in a docs search index made wrong answers), so the reader passes them over
+          NOT_PRODUCT = {"test", "tests", "__tests__", "testing", "spec", "specs", "fixtures", "mocks", "docs", "doc",
+                         "documentation", "document", "site", "examples", "example", "samples"}
+          TEST_FILE = re.compile(r"(^test_.*\.py$|_test\.(?:py|go)$|^conftest\.py$|\.(?:test|spec)\.[cm]?[jt]sx?$|Tests?\.(?:java|cs|kt)$)")
+          SECRET = re.compile(r"(^\.env|\.pem$|\.key$|\.p12$|\.pfx$|id_rsa|credentials|secret)", re.I)
+          CODE = (".py", ".js", ".mjs", ".ts", ".tsx", ".java", ".go", ".cs", ".ipynb", ".yaml", ".yml", ".json", ".toml")
+          MAX_BYTES = 2_000_000  # a file larger than this is not read for model names
+          # model names as the makers write them in API calls: a family prefix, then a version. Speech models too (22 Nov
+          # 2026: whisper-1, tts-1 and voxtral-mini-2602 have shutdown dates on the labs' own pages, and were missed)
+          MODEL = re.compile(r"""["'`]((?:gpt-[0-9][\w.\-]*|o[1-9](?:-[\w.\-]+)?|chatgpt-[\w.\-]+|claude-[\w.\-]+|gemini-[\w.\-]+|"""
+                             r"""whisper-[0-9][\w.\-]*|tts-[0-9][\w.\-]*|voxtral-[\w.\-]+|"""
+                             r"""mistral-[\w.\-]+|magistral-[\w.\-]+|codestral-[\w.\-]+|command-[\w.\-]+|llama-?[0-9][\w.\-]*|"""
+                             r"""meta-llama/[\w.\-]+|deepseek-[\w.\-]+|grok-[\w.\-]+|qwen[0-9][\w.\-]*|text-embedding-[\w.\-]+|"""
+                             r"""(?:anthropic|amazon|meta|mistral|cohere|ai21)\.[\w.\-:]+))["'`]""", re.I)
+          REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._\-]*)\s*(\[[^\]]*\])?\s*(?:([=<>!~]=?|===)\s*([^\s;,#]+))?")
+          TF_SOURCE = re.compile(r'source\s*=\s*"(?:registry\.terraform\.io/)?[\w\-]+/([\w\-]+)"')
+          TF_PROVIDER = re.compile(r'^\s*provider\s+"([\w\-]+)"')
+          TF_REGION = re.compile(r'^\s*(?:region|location)\s*=\s*"([a-z0-9\-]+)"', re.I)
+
+
+          def pypi(name: str) -> str:
+              return re.sub(r"[._]+", "-", name.strip().lower())
+
+
+          def image(ref: str) -> str:
+              """A container image without its tag, digest or the default registry: "postgres:16" is "postgres"."""
+              ref = ref.split("@")[0]
+              last = ref.rsplit("/", 1)
+              if ":" in last[-1]:
+                  ref = ref[: len(ref) - len(last[-1]) + last[-1].index(":")]
+              for pre in ("docker.io/library/", "docker.io/", "library/"):
+                  if ref.startswith(pre):
+                      ref = ref[len(pre):]
+              return ref.lower()
+
+
+          def read_package_json(text, path, out):
+              try:
+                  d = json.loads(text)
+              except ValueError:
+                  return
+              lines = text.splitlines()
+              for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                  for name, ver in (d.get(key) or {}).items():
+                      line = next((i for i, t in enumerate(lines, 1) if f'"{name}"' in t), 0)
+                      out["deps"].append({"eco": "npm", "name": name.lower(), "ver": str(ver), "file": path, "line": line})
+
+
+          def read_requirements(text, path, out):
+              for i, t in enumerate(text.splitlines(), 1):
+                  t = t.split("#")[0].strip()
+                  if not t or t.startswith(("-", "git+", "http")):
+                      continue
+                  m = REQ.match(t)
+                  if m:
+                      out["deps"].append({"eco": "pypi", "name": pypi(m.group(1)), "ver": m.group(4) or "", "file": path,
+                                          "line": i})
+
+
+          def read_toml_deps(text, path, out):
+              """pyproject.toml (PEP 621 lists and Poetry tables) and Pipfile: the dependency names, line by line."""
+              section, in_list = "", False
+              for i, raw in enumerate(text.splitlines(), 1):
+                  t = raw.split("#")[0].strip()
+                  if t.startswith("["):
+                      section, in_list = t.strip("[] ").lower(), False
+                      continue
+                  if in_list or re.match(r"^(dependencies|[\w\-]+)\s*=\s*\[", t) and (
+                          section == "project" and t.startswith("dependencies") or section == "project.optional-dependencies"
+                          or section == "dependency-groups"):
+                      in_list = True
+                      for s in re.findall(r'"([^"]+)"|\'([^\']+)\'', t):
+                          m = REQ.match(s[0] or s[1])
+                          if m:
+                              out["deps"].append({"eco": "pypi", "name": pypi(m.group(1)), "ver": m.group(4) or "",
+                                                  "file": path, "line": i})
+                      if "]" in t:
+                          in_list = False
+                      continue
+                  poetry = section in ("tool.poetry.dependencies", "packages", "dev-packages") or re.match(
+                      r"^tool\.poetry\.group\.[\w\-]+\.dependencies$", section)
+                  m = re.match(r'^"?([A-Za-z0-9][A-Za-z0-9._\-]*)"?\s*=\s*(.+)$', t)
+                  if poetry and m and m.group(1).lower() != "python":
+                      ver = re.search(r'"([^"]*)"', m.group(2))
+                      out["deps"].append({"eco": "pypi", "name": pypi(m.group(1)), "ver": ver.group(1) if ver else "",
+                                          "file": path, "line": i})
+
+
+          def read_dockerfile(text, path, out):
+              for i, t in enumerate(text.splitlines(), 1):
+                  m = re.match(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)", t, re.I)
+                  if m and not m.group(1).startswith("$"):
+                      out["deps"].append({"eco": "docker", "name": image(m.group(1)), "ver": "", "file": path, "line": i})
+
+
+          def read_compose(text, path, out):
+              for i, t in enumerate(text.splitlines(), 1):
+                  m = re.match(r"^\s*image:\s*[\"']?([^\s\"'#]+)", t)
+                  if m and not m.group(1).startswith("$"):
+                      out["deps"].append({"eco": "docker", "name": image(m.group(1)), "ver": "", "file": path, "line": i})
+
+
+          def read_terraform(text, path, out):
+              for i, t in enumerate(text.splitlines(), 1):
+                  for pat in (TF_SOURCE, TF_PROVIDER):
+                      m = pat.search(t)
+                      if m:
+                          out["deps"].append({"eco": "tf", "name": m.group(1).lower(), "ver": "", "file": path, "line": i})
+                  m = TF_REGION.match(t)
+                  if m:
+                      out["regions"].append({"r": m.group(1).lower(), "file": path, "line": i})
+
+
+          def code_lines(text: str, path: str):
+              """(line number, line) for the code only, with the file's own line numbers. Passed over: comment lines, Python
+              docstrings (a line starting with triple quotes, to their close), and in a notebook everything but its code cells'
+              source, since its outputs hold error messages and library code (22 Nov 2026: a word in a comment is not proof)."""
+              nb = path.lower().endswith(".ipynb")
+              cell = src = False
+              doc = None
+              for i, t in enumerate(text.splitlines(), 1):
+                  st = t.strip()
+                  if nb:  # a saved notebook keeps one source line per JSON line, inside "source": [ ... ] of each cell
+                      if st.startswith('"cell_type"'):
+                          cell, src = '"code"' in st, False
+                          continue
+                      if st.startswith('"source"'):
+                          src = cell and st.endswith("[")
+                          continue
+                      if src and st in ("]", "],"):
+                          src = False
+                      if not src:
+                          continue
+                      st = st.rstrip(",").strip('"').replace("\\n", "").replace('\\"', '"').strip()
+                  if doc:
+                      if doc in st:
+                          doc = None
+                      continue
+                  q = next((q for q in ('"""', "'''") if st.lstrip("rRbBuUfF").startswith(q)), None)
+                  if q:
+                      if st.count(q) == 1:
+                          doc = q
+                      continue
+                  if st.startswith(("#", "//", "/*", "*", "<!--")):
+                      continue
+                  yield i, (st if nb else t)
+
+
+          # a file name that starts like a model ("anthropic.css", "claude-lock.json") is not a model (22 Nov 2026)
+          FILE_NAME = re.compile(r"\.(css|scss|js|mjs|cjs|ts|tsx|jsx|json|lock|md|txt|html|py|png|svg|jpg|ico|ya?ml|toml|sh)$", re.I)
+
+
+          def read_models(text, path, out):
+              for i, t in code_lines(text, path):
+                  for m in MODEL.finditer(t):
+                      if not FILE_NAME.search(m.group(1)):
+                          out["models"].append({"m": m.group(1), "file": path, "line": i})
+
+
+          # What the code shows about the Risk Monitor's questions: (question, answer, pattern). Only what is found is reported,
+          # with the first file and line; nothing found says nothing (the firm answers it). The firm confirms every one.
+          SIGNALS = [
+              ("personal", True, re.compile(r"\b(date_of_birth|dateOfBirth|national_id|nationalId|passport_(?:no|number)|ssn|"
+                                            r"social_security|iban|tax_id|aadhaar|pan_number|phone_number|phoneNumber|"
+                                            r"email_address|home_address|first_name|last_name)\b", re.I)),
+              # 22 Nov 2026: training once (.fit, a train/test split) doesn't show the model is retrained from time to time, and a
+              # chart of what drives the model (SHAP, LIME) doesn't show customers get reasons: only code that does either counts
+              ("retrain", True, re.compile(r"\bretrain\w*\s*\(", re.I)),
+              ("explains", True, re.compile(r"\b(reason_codes?|adverse_action\w*|decline_reasons?|principal_reasons?)\b", re.I)),
+              ("chatbot", True, re.compile(r"(\buseChat\(|@chatscope/|\bbotbuilder\b|\brasa\b|[\"']/(?:api/)?chat[\"'/])", re.I)),
+              ("says_ai", True, re.compile(r"(I am an? (?:AI|virtual assistant|automated assistant)|I'm an? (?:AI|virtual assistant)|"
+                                           r"you are (?:chatting|talking) (?:with|to) an? (?:AI|virtual assistant|bot)|"
+                                           # a label on AI-made content (Article 50; fix flows Day 3, 15 Nov 2026)
+                                           r"\bAI[- ]generated\b|\bgenerated (?:by|with|using) (?:an? )?AI\b|"
+                                           r"\b(?:written|created|made) (?:by|with) (?:an? )?AI\b)", re.I)),
+              # AI agents (Compass agent checks, fix flows Day 4, owner 15 Nov 2026): an agent or tool calling, a step limit or
+              # stop flag, and a person approving before it acts. Each only where it is found; the firm confirms each one
+              ("agent", True, re.compile(r"(\bcreate_react_agent\b|\bAgentExecutor\b|\binitialize_agent\b|\bStateGraph\(|\bCrew\(|"
+                                         r"\bAssistantAgent\(|\bbind_tools\(|\btool_choice\b|\btool_calls\b|@function_tool\b|"
+                                         r"\bAgent\(\s*(?:name|model|instructions|role)\s*=)")),
+              ("agent_stop", True, re.compile(r"\b(max_iterations|max_steps|recursion_limit|max_turns|max_rounds|"
+                                              r"max_consecutive_auto_reply|max_execution_time|kill_?switch|stop_agent)\b", re.I)),
+              ("agent_approval", True, re.compile(r"(\binterrupt_(?:before|after)\b|\binterrupt\(|\bhuman_in_the_loop\b|"
+                                                  r"\bHumanApprovalCallbackHandler\b|\brequires?_approval\b|\bapproval_required\b|"
+                                                  r"\bneeds_approval\b|\bhuman_input_mode\s*=\s*[\"']ALWAYS)", re.I)),
+          ]
+          # where an agent's tools are defined: the files are counted, so a reviewer knows whether they sit in one place
+          TOOLS = re.compile(r"(@tool\b|@function_tool\b|\bStructuredTool\b|\bTool\(\s*name\s*=|\bbind_tools\(|"
+                             r"[\"']type[\"']\s*:\s*[\"']function[\"'])")
+          # Agent access map (owner, 18 Nov 2026): each tool an agent may call, by name, and what its own lines can do. Read
+          # from the tool's body only: a helper it calls elsewhere is not followed. Key names are kept, never their values
+          TOOL_DEF = [re.compile(r"^(\s*)@(?:\w+\.)?(?:tool|function_tool)\b"),          # Python: @tool, @function_tool
+                      re.compile(r"\b(?:const|let|var)\s+(\w+)\s*=\s*tool\(\s*\{"),     # JS/TS: const pay = tool({ ... })
+                      re.compile(r"\bTool\(\s*name\s*=\s*[\"']([\w\-]+)[\"']")]         # Python: Tool(name="pay", func=...)
+          ACCESS = [("money", re.compile(r"(\b(?:refund|payout|charges?\.create|transfer_funds|wire_transfer|payment_intent|"
+                                         r"PaymentIntent|make_payment|send_payment|create_payment|initiate_payment)\w*|\bstripe\.)", re.I)),
+                    ("records", re.compile(r"(\b(?:INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|DROP\s+TABLE)\b|\.(?:save|delete|"
+                                           r"insert_one|insert_many|update_one|update_many|delete_one|delete_many|put_item|"
+                                           r"delete_item|bulk_write|upsert)\(|\bsession\.commit\(|\.commit\(\))", re.I)),
+                    ("messages", re.compile(r"(\bsmtplib\b|\bsend_mail\b|\bsendmail\(|\bsendgrid\b|\btwilio\b|\bchat_postMessage\b|"
+                                            r"\bmessages\.create\(\s*(?:to|body)\s*=|\bsend_email\b|\bsend_sms\b|\bnodemailer\b)", re.I)),
+                    ("web", re.compile(r"(\b\w+\.(?:post|put|patch)\(|"
+                                       r"\bmethod\s*:\s*[\"'](?:POST|PUT|PATCH|DELETE)[\"'])", re.I)),
+                    ("commands", re.compile(r"(\bsubprocess\.|\bos\.system\(|\bos\.popen\(|\bexec\(|\beval\(|\bchild_process\b|"
+                                            r"\bexecSync\(|\bspawn\()")),
+                    ("files", re.compile(r"(\bopen\([^)]*[\"'][wa]b?\+?[\"']|\.write_text\(|\.write_bytes\(|\bwriteFile(?:Sync)?\(|"
+                                         r"\bshutil\.(?:rmtree|move)\(|\bos\.remove\(|\bunlink(?:Sync)?\()"))]
+          # these act on the world, so a person should approve them before they run
+          ACTS = ("money", "records", "messages", "web", "commands", "files")
+          KEY_NAME = re.compile(r"(?:os\.environ(?:\.get)?\(\s*|os\.environ\[\s*|os\.getenv\(\s*|process\.env\.)[\"']?"
+                                r"([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIALS?|DSN|URL))\b")
+          APPROVE = re.compile(r"(\binterrupt\(|\bhuman_in_the_loop\b|\brequires?_approval\b|\bapproval_required\b|\bneeds_approval\b|"
+                               r"\bneedsApproval\b|\bask_human\b|\bconfirm_with_user\b|\binput\()", re.I)
+          BODY_MAX = 80  # lines read after a tool's definition at most
+
+
+          def _body(lines: list[str], i: int, js: bool) -> list[str]:
+              """The tool's own lines from line i: to the closing brace in JS/TS, to the next line at the decorator's indent in
+              Python. At most BODY_MAX lines."""
+              out, depth = [], 0
+              if js:
+                  for t in lines[i:i + BODY_MAX]:
+                      out.append(t)
+                      depth += t.count("{") + t.count("(") - t.count("}") - t.count(")")
+                      if depth <= 0 and len(out) > 1:
+                          break
+                  return out
+              ind = len(lines[i]) - len(lines[i].lstrip())
+              started = False
+              for t in lines[i:i + BODY_MAX]:
+                  s = t.strip()
+                  if started and s and len(t) - len(t.lstrip()) <= ind and not s.startswith(("@", ")", "]")):
+                      break
+                  if re.match(r"\s*(?:async\s+)?def\s", t):
+                      started = True
+                  out.append(t)
+              return out
+
+
+          def read_access(text, path, out):
+              """Each tool an agent may call, with what its own lines can do, the key names it reads and whether a person
+              approves inside it. One row per tool."""
+              lines = text.splitlines()
+              js = path.lower().endswith((".js", ".mjs", ".ts", ".tsx"))
+              inside = set()  # line numbers that belong to a tool's own lines
+              for i, t in enumerate(lines):
+                  name = None
+                  m = TOOL_DEF[0].match(t)
+                  if m and not js:
+                      nxt = next((x for x in lines[i + 1:i + 6] if re.match(r"\s*(?:async\s+)?def\s", x)), "")
+                      d = re.search(r"def\s+(\w+)", nxt)
+                      name = d.group(1) if d else None
+                  else:
+                      for pat in TOOL_DEF[1:]:
+                          m = pat.search(t)
+                          if m:
+                              name = m.group(1)
+                              break
+                  if not name:
+                      continue
+                  body = _body(lines, i, js or "tool(" in t)
+                  if not js and TOOL_DEF[2].search(t):
+                      # Tool(name=..., func=fn): the body is the function it names, when that is in the same file
+                      f = re.search(r"func\s*=\s*(\w+)", "\n".join(lines[i:i + 4]))
+                      at = next((k for k, x in enumerate(lines) if f and re.match(r"\s*(?:async\s+)?def\s+" + f.group(1) + r"\b", x)), None)
+                      body = _body(lines, at, False) if at is not None else [t]
+                      inside.update(range(at, at + len(body)) if at is not None else ())
+                  inside.update(range(i, i + len(body)))
+                  blob = "\n".join(body)
+                  can = [k for k, pat in ACCESS if pat.search(blob)]
+                  keys = sorted(set(KEY_NAME.findall(blob)))
+                  out["agent_access"].append({"tool": name, "can": can, "keys": keys, "approval": bool(APPROVE.search(blob)),
+                                              "file": path, "line": i + 1})
+              # a person approving in the agent's setup (not inside one tool) covers every tool: the first such line
+              approve = dict((q, p) for q, _, p in SIGNALS)["agent_approval"]
+              if "agent_setup_approval" not in out:
+                  for i, t in enumerate(lines):
+                      if i not in inside and approve.search(t):
+                          out["agent_setup_approval"] = {"file": path, "line": i + 1}
+                          break
+          # the job the AI does, from the names in the code: Risk Monitor use -> pattern (the most hits wins, and is only a suggestion)
+          USES = [("credit-scoring", re.compile(r"\b(credit_?score|creditworth\w*|scorecard)\b", re.I)),
+                  ("pd-models", re.compile(r"\b(probability_of_default|pd_model|default_prob\w*)\b", re.I)),
+                  ("loan-decisions", re.compile(r"\bloan_?(decision|approval|application)s?\b", re.I)),
+                  ("fraud-detection", re.compile(r"\b(fraud_?(score|detect\w*|model)|is_fraud)\b", re.I)),
+                  ("aml", re.compile(r"\b(aml|anti_money_laundering|transaction_monitoring|suspicious_activity)\b", re.I)),
+                  ("kyc", re.compile(r"\b(kyc|know_your_customer|customer_due_diligence)\b", re.I)),
+                  ("underwriting", re.compile(r"\bunderwrit\w*\b", re.I)),
+                  ("claims", re.compile(r"\bclaims?_(triage|handling|assessment|model)\b", re.I))]
+          RETENTION = re.compile(r"^\s*(?:retention_in_days|retention_days|log_retention_days|retentionInDays)\s*=\s*(\d+)", re.I)
+          APP_DEPS = {"react-native", "expo", "@capacitor/core", "@ionic/react"}
+
+
+          def read_signals(text, path, out):
+              for i, t in code_lines(text, path):
+                  for q, v, pat in SIGNALS:
+                      if pat.search(t):
+                          out["_sig"].setdefault(q, {"q": q, "value": v, "file": path, "line": i})
+                  if TOOLS.search(t):
+                      out.setdefault("_tools", {}).setdefault(path, i)
+                  for use, pat in USES:
+                      if pat.search(t):
+                          u = out["_use"].setdefault(use, {"n": 0, "file": path, "line": i})
+                          u["n"] += 1
+
+
+          def signals(out: dict) -> list[dict]:
+              """The answers the code supports, each with where it was found."""
+              sig = list(out.pop("_sig").values())
+              uses = out.pop("_use")
+              if uses:
+                  use, u = max(uses.items(), key=lambda kv: kv[1]["n"])
+                  sig.insert(0, {"q": "use", "value": use, "file": u["file"], "line": u["line"]})
+              days = [(int(m.group(1)), path, line) for path, line, m in out.pop("_ret")]
+              if days:
+                  d = min(days)
+                  sig.append({"q": "log_days", "value": d[0], "file": d[1], "line": d[2]})
+              app = next((d for d in out["deps"] if d["name"] in APP_DEPS), None) or out.pop("_app", None)
+              out.pop("_app", None)
+              if app:
+                  sig.append({"q": "app", "value": True, "file": app["file"], "line": app.get("line", 0)})
+              tools = out.pop("_tools", {})
+              if tools:  # value: how many files define tools; file and line: the first
+                  first = min(tools)
+                  sig.append({"q": "agent_tools", "value": len(tools), "file": first, "line": tools[first]})
+              return sig
+
+
+          def reader(name: str):
+              n = name.lower()
+              if n == "package.json":
+                  return read_package_json
+              if re.match(r"^requirements.*\.(txt|in)$", n):
+                  return read_requirements
+              if n in ("pyproject.toml", "pipfile"):
+                  return read_toml_deps
+              if n.startswith("dockerfile") or n.endswith(".dockerfile"):
+                  return read_dockerfile
+              if re.match(r"^(docker-)?compose.*\.ya?ml$", n):
+                  return read_compose
+              if n.endswith(".tf"):
+                  return read_terraform
+              return None
+
+
+          def scan(root: str) -> dict:
+              out = {"tool": "pulse-stack-scan", "version": VERSION, "made": date.today().isoformat(), "deps": [],
+                     "regions": [], "models": [], "audit": [], "files": [], "agent_access": [], "_sig": {}, "_use": {}, "_ret": []}
+              for folder, dirs, names in os.walk(root):
+                  dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and d.lower() not in NOT_PRODUCT and not d.startswith("."))
+                  # a phone app's own folders say customers reach the product through an app
+                  here = os.path.relpath(folder, root).replace(os.sep, "/")
+                  if "_app" not in out and ({"android", "ios"} <= set(dirs) or "pubspec.yaml" in names):
+                      out["_app"] = {"file": (here + "/" if here != "." else "") + ("pubspec.yaml" if "pubspec.yaml" in names else "android/"),
+                                     "line": 0}
+                  for name in sorted(names):
+                      full = os.path.join(folder, name)
+                      rel = os.path.relpath(full, root).replace(os.sep, "/")
+                      if SECRET.search(name) or name == "stack.json" or TEST_FILE.search(name):
+                          continue
+                      fn = reader(name)
+                      code = name.lower().endswith(CODE) and name.lower() != "package-lock.json"
+                      if not fn and not code:
+                          continue
+                      try:
+                          if os.path.getsize(full) > MAX_BYTES:
+                              continue
+                          with open(full, encoding="utf-8", errors="replace") as f:
+                              text = f.read()
+                      except OSError:
+                          continue
+                      if fn:
+                          fn(text, rel, out)
+                          out["files"].append(rel)
+                      if name.lower().endswith(".tf"):
+                          out["_ret"] += [(rel, i, m) for i, t in enumerate(text.splitlines(), 1) for m in [RETENTION.match(t)] if m]
+                      if code:
+                          read_models(text, rel, out)
+                          read_signals(text, rel, out)
+                          if rel.lower().endswith((".py", ".js", ".mjs", ".ts", ".tsx")):
+                              read_access(text, rel, out)
+              # each model once per file, in the order found
+              seen, models = set(), []
+              for m in out["models"]:
+                  if (m["m"].lower(), m["file"]) not in seen:
+                      seen.add((m["m"].lower(), m["file"]))
+                      models.append(m)
+              out["models"] = models
+              out["signals"] = signals(out)
+              return out
+
+
+          def audit(root: str, out: dict) -> None:
+              """The firm's own audit tools, where installed: their findings, by package."""
+              if shutil.which("npm") and os.path.exists(os.path.join(root, "package-lock.json")):
+                  try:
+                      r = subprocess.run(["npm", "audit", "--json"], cwd=root, capture_output=True, text=True, timeout=300)
+                      for name, v in (json.loads(r.stdout or "{}").get("vulnerabilities") or {}).items():
+                          ids = [x.get("url", "") for x in v.get("via", []) if isinstance(x, dict)]
+                          out["audit"].append({"eco": "npm", "name": name, "ver": v.get("range", ""), "severity": v.get("severity", ""),
+                                               "ids": ids[:3], "fix": bool(v.get("fixAvailable")), "by": "npm audit"})
+                  except (OSError, ValueError, subprocess.SubprocessError):
+                      print("npm audit did not run; carrying on without it", file=sys.stderr)
+              if shutil.which("pip-audit"):
+                  reqs = [f for f in os.listdir(root) if re.match(r"^requirements.*\.txt$", f)]
+                  args = ["pip-audit", "-f", "json"] + [x for f in reqs for x in ("-r", f)]
+                  try:
+                      r = subprocess.run(args, cwd=root, capture_output=True, text=True, timeout=600)
+                      d = json.loads(r.stdout or "{}")
+                      for dep in d.get("dependencies", d if isinstance(d, list) else []):
+                          for v in dep.get("vulns", []):
+                              out["audit"].append({"eco": "pypi", "name": pypi(dep["name"]), "ver": dep.get("version", ""),
+                                                   "severity": "", "ids": [v.get("id", "")], "fix": bool(v.get("fix_versions")),
+                                                   "by": "pip-audit"})
+                  except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                      print("pip-audit did not run; carrying on without it", file=sys.stderr)
+
+
+          MODELS_LAYER, REGIONS_LAYER, OTHER_SHOWN = "Model names", "Cloud regions", 10
+
+
+          def _layer(key: str, layers: dict) -> str:
+              """The layer a package belongs to, from the layers list ("eco:name", a trailing * matches a prefix); "" if none."""
+              for pat, name in layers.items():
+                  if (key.startswith(pat[:-1]) and len(key) > len(pat) - 1) if pat.endswith("*") else key == pat:
+                      return name
+              return ""
+
+
+          def compare(old: dict, new: dict, layers: dict | None = None) -> dict:
+              """What changed between two scans: a part taken out and another put in on the same layer is a swap; the rest is
+              added, removed or a new version. Packages on no layer are only listed by name."""
+              layers = layers or {}
+
+              def deps(s):
+                  d = {}
+                  for x in s.get("deps", []):
+                      d.setdefault(x["eco"] + ":" + x["name"], x)
+                  return d
+
+              def models(s):
+                  d = {}
+                  for x in s.get("models", []):
+                      d.setdefault(x["m"].lower(), {"name": x["m"], "file": x["file"], "line": x["line"]})
+                  return d
+
+              def regions(s):
+                  d = {}
+                  for x in s.get("regions", []):
+                      d.setdefault(x["r"], {"name": x["r"], "file": x["file"], "line": x["line"]})
+                  return d
+
+              out, by_layer, other = [], {}, {"added": [], "removed": []}
+              a, b = deps(old), deps(new)
+              for key in sorted(set(a) | set(b)):
+                  x, y = a.get(key), b.get(key)
+                  layer = _layer(key, layers)
+                  if x and y:
+                      if layer and x.get("ver", "") != y.get("ver", ""):
+                          out.append({"kind": "version", "layer": layer, "name": y["name"], "from": x.get("ver", ""),
+                                      "to": y.get("ver", ""), "file": y["file"], "line": y.get("line", 0), "eco": y["eco"]})
+                      continue
+                  side = "added" if y else "removed"
+                  z = y or x
+                  if layer:
+                      by_layer.setdefault(("dep", layer), {"added": [], "removed": []})[side].append(
+                          {"name": z["name"], "file": z["file"], "line": z.get("line", 0), "eco": z["eco"]})
+                  elif z["eco"] != "tf":
+                      other[side].append(z["name"])
+              for src, layer, (a, b) in (("model", MODELS_LAYER, (models(old), models(new))),
+                                         ("region", REGIONS_LAYER, (regions(old), regions(new)))):
+                  for k in sorted(set(a) ^ set(b)):
+                      side = "added" if k in b else "removed"
+                      by_layer.setdefault((src, layer), {"added": [], "removed": []})[side].append((b if k in b else a)[k])
+              # each change says where it came from (a package with its "eco", a model name or a region), so a page can rebuild
+              # the stack as it was before; a swap keeps the old part's file and line in "was_file" and "was_line"
+              for (src, layer), ch in by_layer.items():
+                  gone, came = ch["removed"], ch["added"]
+
+                  def item(kind, x, **more):
+                      return {"kind": kind, "layer": layer, "name": x["name"], "file": x["file"], "line": x["line"], "src": src,
+                              **({"eco": x["eco"]} if "eco" in x else {}), **more}
+                  for x, y in zip(gone, came):
+                      out.append(item("swap", y, name=x["name"], to=y["name"], was_file=x["file"], was_line=x["line"]))
+                  for y in came[len(gone):]:
+                      out.append(item("added", y))
+                  for x in gone[len(came):]:
+                      out.append(item("removed", x))
+              order = {"swap": 0, "added": 1, "removed": 2, "version": 3}
+              out.sort(key=lambda c: (order[c["kind"]], c["layer"], c["name"]))
+              return {"since": old.get("made", ""), "items": out, "other": other}
+
+
+          def _norm(s: str) -> str:
+              return re.sub(r"[^a-z0-9]", "", str(s).lower().split(" (")[0])
+
+
+          def same_model(code: str, watch: str) -> bool:
+              """A model named in code against a maker's model name: the same, or the same with a date after it."""
+              a, b = _norm(code), _norm(watch)
+              return bool(a and b) and (a == b or (a.startswith(b) and a[len(b):].isdigit()))
+
+
+          def check(policy: dict, scan: dict, today: str) -> dict:
+              """What a policy file (.github/pulse-policy.json, from the Risk Monitor) names in this scan, each hit "block" or
+              "warn". A model past its maker's shutdown date and a part with a government order, ban or fine are "block"; a
+              shutdown still ahead and other notices are "warn". The check fails only in mode "block" with a "block" hit."""
+              hits = []
+              for r in policy.get("rules", []):
+                  if r.get("kind") == "shutdown":
+                      m = next((x for x in scan.get("models", []) if same_model(x["m"], r["model"])), None)
+                      if m:
+                          past, who = today >= r["date"], r.get("maker") or "its maker"
+                          hits.append({"level": "block" if past else "warn", "name": m["m"], "file": m["file"], "line": m["line"],
+                                       "say": f"shut by {who} on {r['date']}" if past else f"{who} shuts it on {r['date']}",
+                                       "url": r.get("url", "")})
+                  elif r.get("kind") in ("order", "notice"):
+                      pats = {p: "x" for p in r.get("match", [])}
+                      d = next((d for d in scan.get("deps", []) if _layer(d["eco"] + ":" + d["name"], pats)), None)
+                      if d:
+                          hits.append({"level": "block" if r["kind"] == "order" else "warn", "name": r.get("part") or d["name"],
+                                       "file": d["file"], "line": d.get("line", 0), "say": f"{r.get('what', '')} ({r.get('date', '')})",
+                                       "url": r.get("url", "")})
+              seen, out = set(), []
+              for h in sorted(hits, key=lambda h: h["level"] != "block"):
+                  if (h["name"], h["say"]) not in seen:
+                      seen.add((h["name"], h["say"]))
+                      out.append(h)
+              mode = "block" if policy.get("mode") == "block" else "warn"
+              return {"made": policy.get("made", ""), "mode": mode, "hits": out,
+                      "fail": mode == "block" and any(h["level"] == "block" for h in out)}
+
+
+          # Pulse Compass's plan file (20 Nov 2026): what the plan picked, read against this scan. Reports only, never fails, and
+          # says nothing about when: the plan's order and timing are the firm's own
+          PLAN_FORMAT, PLAN_VERSION = "pulse-compass-plan", 1
+          # the trial kit's files as the report names them
+          KIT = ("0-read-me.txt", "3-starting-prompt.txt", ("4-questions-before-you-sign.txt", "4-questions-for-suppliers.txt"),
+                 "5-sign-off-sheet.csv", "6-problems-sheet.csv", "7-team-feedback.csv", "8-evidence-record.csv")
+
+
+          def _kit_found(root: str) -> set:
+              """The kit's file names found anywhere in the repository, by name only: the files are never read."""
+              want = {n for k in KIT for n in (k if isinstance(k, tuple) else (k,))}
+              found = set()
+              for folder, dirs, names in os.walk(root):
+                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+                  found |= want & set(names)
+              return found
+
+
+          def plan_check(plan: dict, scan: dict, old: dict | None = None, kit: set | None = None) -> dict | None:
+              """A Compass plan file against this scan. "uncovered": models in the code that are none of the plan's picks or
+              shortlist, each marked new when the earlier scan (the base branch on a pull request) didn't have it. "picks": each
+              of the plan's picks, in the code, not in it, or taken out since the earlier scan. "kit": the trial kit's files
+              found and missing. None when the file is not a plan file this script can read."""
+              if not isinstance(plan, dict) or plan.get("format") != PLAN_FORMAT or not isinstance(plan.get("version"), int) \
+                      or not 1 <= plan["version"] <= PLAN_VERSION or not isinstance((plan.get("plan") or {}).get("picks"), list):
+                  return None
+              p = plan["plan"]
+              picks = [str(m) for m in p["picks"]]
+              planned = picks + [str(m) for m in p.get("sl") or [] if str(m) not in picks]
+              now, was = scan.get("models", []), (old or {}).get("models", [])
+
+              def where(models, name):
+                  return next((x for x in models if same_model(x["m"], name)), None)
+              uncovered, seen = [], set()
+              for x in now:
+                  if not any(same_model(x["m"], m) for m in planned) and _norm(x["m"]) not in seen:
+                      seen.add(_norm(x["m"]))
+                      uncovered.append({"name": x["m"], "file": x["file"], "line": x.get("line", 0),
+                                        "new": old is not None and not any(_norm(y["m"]) == _norm(x["m"]) for y in was)})
+              out_picks = []
+              for m in picks:
+                  h, o = where(now, m), where(was, m)
+                  at = h or o or {}
+                  out_picks.append({"name": m, "state": "in" if h else "gone" if o else "absent",
+                                    "file": at.get("file", ""), "line": at.get("line", 0)})
+              kit = kit or set()
+              have = [k if isinstance(k, str) else next((n for n in k if n in kit), k[0]) for k in KIT]
+              return {"saved": str(plan.get("saved", "")), "uncovered": uncovered, "picks": out_picks,
+                      "kit": {"found": [n for n in have if n in kit], "missing": [n for n in have if n not in kit]},
+                      "new": any(u["new"] for u in uncovered) or any(x["state"] == "gone" for x in out_picks)}
+
+
+          def _plan_note(plan: dict | None) -> str:
+              """The plan file's reading as a table, after the change and the policy: facts only, no dates to meet."""
+              if not plan:
+                  return ""
+
+              def at(x):
+                  return (f"`{x['file']}" + (f":{x['line']}" if x.get("line") else "") + "`") if x.get("file") else ""
+              rows = [f"| Not in the plan | `{u['name']}`" + (" (new in this change)" if u["new"] else "") + f" | {at(u)} |" for u in plan["uncovered"]]
+              word = {"in": "Planned pick, in the code", "absent": "Planned pick, not in the code", "gone": "Planned pick, taken out of the code"}
+              rows += [f"| {word[x['state']]} | `{x['name']}` | " + ("was " + at(x) if x["state"] == "gone" else at(x)) + " |" for x in plan["picks"]]
+              k = plan["kit"]
+              n = len(k["found"]) + len(k["missing"])
+              kit = (f"Trial kit: {len(k['found'])} of {n} files in this repository" + (f"; not here: {', '.join(k['missing'])}." if k["missing"] else ".")
+                     if k["found"] else f"Trial kit: none of its {n} files is in this repository.")
+              end = ("\nA model not in the plan can be added by opening the plan file in Pulse Compass and running the report again "
+                     "with today's facts." if plan["uncovered"] else "")
+              return "\n".join(["", f"#### Pulse Compass plan of {plan['saved'] or 'unknown date'}", "",
+                                "| Plan | Model | Where |", "|---|---|---|", *rows, "", kit]) + end + "\n"
+
+
+          def _policy_note(policy: dict | None) -> str:
+              """The policy file's hits as a table, after the change: what fails the check first."""
+              if not policy or not policy["hits"]:
+                  return ""
+              word = {"block": "Fails the check" if policy["mode"] == "block" else "Would fail in block mode", "warn": "Warning"}
+              rows = [f"| {word[h['level']]} | `{h['name']}` | {h['say']} | `{h['file']}" + (f":{h['line']}" if h.get("line") else "") + "` |"
+                      for h in policy["hits"]]
+              return "\n".join(["", f"#### Policy file of {policy['made'] or 'unknown date'}, mode {policy['mode']}", "",
+                                "| Result | Part | What | Where |", "|---|---|---|---|", *rows]) + "\n"
+
+
+          def report(ch: dict, title: str = "Stack change", policy: dict | None = None, plan: dict | None = None) -> str:
+              """The change as a short Markdown note: for a pull request comment or the run's summary. Facts only. A policy
+              file's hits follow it."""
+              items, other = ch["items"], ch["other"]
+              note = _policy_note(policy)
+              lines = ["<!-- pulse-stack -->", f"### Pulse Pro Engine: {title.lower() if items or any(other.values()) else 'policy check' if note else 'plan check' if plan else 'no stack change'}"]
+              if not items and not any(other.values()):
+                  lines.append("No AI model, package, container image or cloud region changed" + (f" since the scan of {ch['since']}." if ch["since"] else "."))
+                  return "\n".join(lines) + "\n" + note + _plan_note(plan)
+
+              def at(c):
+                  return f"`{c['file']}" + (f":{c['line']}" if c.get("line") else "") + "`"
+              word = {"swap": "Swapped", "added": "Added", "removed": "Removed", "version": "New version"}
+              lines += ["", "| Change | Layer | What | Where |", "|---|---|---|---|"]
+              for c in items:
+                  what = {"swap": f"`{c['name']}` → `{c.get('to', '')}`", "version": f"`{c['name']}` {c.get('from') or 'any'} → {c.get('to') or 'any'}"
+                          }.get(c["kind"], f"`{c['name']}`")
+                  lines.append(f"| {word[c['kind']]} | {c['layer']} | {what} | {at(c) if c['kind'] != 'removed' else 'was ' + at(c)} |")
+              for side in ("added", "removed"):
+                  names = other[side]
+                  if names:
+                      shown = ", ".join(f"`{n}`" for n in names[:OTHER_SHOWN]) + (f" and {len(names) - OTHER_SHOWN} more" if len(names) > OTHER_SHOWN else "")
+                      lines.append(f"\nOther packages {side}: {shown}.")
+              lines.append("\nOn a Pulse Pro Engine page, Connect GitHub reads the newest scan, so the Risk Monitor and Watch see this change.")
+              return "\n".join(lines) + "\n" + _policy_note(policy) + _plan_note(plan)
+
+
+          def events(ch: dict, made: str) -> list[dict]:
+              """The change as one JSON object per line, for a log or security tool to read in: the day, what kind of change,
+              the layer, the part, and where it is in the repository."""
+              out = [{"time": made, "source": "pulse-stack-scan", "since": ch["since"], "kind": c["kind"], "layer": c["layer"],
+                      "name": c["name"], **({"to": c["to"]} if c.get("to") else {}), **({"from": c["from"]} if c.get("from") else {}),
+                      "file": c["file"], "line": c.get("line", 0)} for c in ch["items"]]
+              out += [{"time": made, "source": "pulse-stack-scan", "since": ch["since"], "kind": side, "layer": "", "name": n,
+                       "file": "", "line": 0} for side in ("added", "removed") for n in ch["other"][side]]
+              return out
+
+
+          def _lines(text: str) -> list[str]:
+              """A record file's lines as written: a Windows line ending is not part of a line, and the blank end is dropped."""
+              out = [x[:-1] if x.endswith("\r") else x for x in text.split("\n")]
+              while out and out[-1] == "":
+                  out.pop()
+              return out
+
+
+          def fingerprint(line: str) -> str:
+              return hashlib.sha256(line.encode("utf-8")).hexdigest()
+
+
+          def record(path: str, evs: list[dict]) -> int:
+              """Add each event to the record file as one line holding the fingerprint of the line before it ("" for the first
+              line). Lines already there are never rewritten."""
+              if not evs:
+                  return 0
+              try:
+                  with open(path, encoding="utf-8", newline="") as f:
+                      old = f.read()
+              except OSError:
+                  old = ""
+              have = _lines(old)
+              prev = fingerprint(have[-1]) if have else ""
+              new = []
+              for e in evs:
+                  line = json.dumps({"prev": prev, **e}, ensure_ascii=False, separators=(",", ":"))
+                  new.append(line)
+                  prev = fingerprint(line)
+              with open(path, "a", encoding="utf-8", newline="") as f:
+                  f.write(("\n" if old and not old.endswith("\n") else "") + "".join(x + "\n" for x in new))
+              return len(new)
+
+
+          def check_record(text: str) -> dict:
+              """Whether a record file's chain is unbroken: line 1 starts it, and every later line holds the fingerprint of the
+              line before. "at" is the first line that doesn't fit, "why" says how: start (lines taken off the top), line (not a
+              record line) or link (this line or the one before was changed, or lines between them were taken out or put in).
+              "last" is the last line's fingerprint, which changes if that line is changed."""
+              lines = _lines(text)
+              for i, line in enumerate(lines):
+                  try:
+                      row = json.loads(line)
+                  except ValueError:
+                      row = None
+                  if not isinstance(row, dict) or not isinstance(row.get("prev"), str):
+                      return {"lines": len(lines), "ok": False, "at": i + 1, "why": "line"}
+                  if row["prev"] != (fingerprint(lines[i - 1]) if i else ""):
+                      return {"lines": len(lines), "ok": False, "at": i + 1, "why": "link" if i else "start"}
+              return {"lines": len(lines), "ok": True, "at": 0, "why": "", "last": fingerprint(lines[-1]) if lines else ""}
+
+
+          def say(r: dict) -> str:
+              """What the check found, in the same words as the check page (record_logic.js)."""
+              if r["ok"]:
+                  return f"Intact. All {r['lines']} lines follow on from each other." if r["lines"] else "The file has no record lines."
+              if r["why"] == "start":
+                  return "Line 1 is not the first record: lines were taken off the top of the file."
+              if r["why"] == "line":
+                  return f"Line {r['at']} is not a record line."
+              return (f"The chain breaks at line {r['at']}. Line {r['at'] - 1} or line {r['at']} was changed, or lines between them "
+                      f"were taken out or put in." + (f" Lines 1 to {r['at'] - 2} are intact." if r["at"] > 3 else " Line 1 is intact." if r["at"] == 3 else ""))
+
+
+          def main(argv=None) -> int:
+              args = list(sys.argv[1:] if argv is None else argv)
+              if args[:1] == ["--check"] and len(args) == 2:
+                  with open(args[1], encoding="utf-8", newline="") as f:
+                      r = check_record(f.read())
+                  print(say(r) + (f" Fingerprint of the last line: {r['last']}" if r.get("last") else ""))
+                  return 0 if r["ok"] else 1
+              opts = {}
+              for flag in ("--out", "--since", "--layers", "--report", "--events", "--policy", "--plan", "--record"):
+                  if flag in args:
+                      i = args.index(flag)
+                      opts[flag] = args[i + 1]
+                      del args[i:i + 2]
+              target = opts.get("--out", "stack.json")
+              do_audit = "--audit" in args
+              args = [a for a in args if a != "--audit"]
+              root = os.path.abspath(args[0] if args else ".")
+              out = scan(root)
+              if do_audit:
+                  audit(root, out)
+              if "--policy" in opts:
+                  # a policy file from the Risk Monitor: what in this scan it names. A missing or unreadable one checks nothing
+                  try:
+                      with open(opts["--policy"], encoding="utf-8") as f:
+                          out["policy"] = check(json.load(f), out, date.today().isoformat())
+                  except (OSError, ValueError, KeyError, TypeError):
+                      pass
+              if "--plan" in opts:
+                  # a Compass plan file: what the plan picked, against this scan and the earlier one. A missing one checks nothing
+                  try:
+                      with open(opts["--plan"], encoding="utf-8") as f:
+                          plan = json.load(f)
+                      old = None
+                      if "--since" in opts:
+                          try:
+                              with open(opts["--since"], encoding="utf-8") as f:
+                                  old = json.load(f)
+                          except (OSError, ValueError):
+                              pass
+                      got = plan_check(plan, out, old, _kit_found(root))
+                      if got:
+                          out["plan"] = got
+                  except (OSError, ValueError, KeyError, TypeError):
+                      pass
+              if "--since" in opts:
+                  # an earlier stack.json: what changed since it. A missing or unreadable one means a first scan, with no change
+                  try:
+                      with open(opts["--since"], encoding="utf-8") as f:
+                          old = json.load(f)
+                      layers = {}
+                      if "--layers" in opts:
+                          with open(opts["--layers"], encoding="utf-8") as f:
+                              layers = json.load(f)
+                      out["changes"] = compare(old, out, layers)
+                  except (OSError, ValueError):
+                      pass
+                  if "--report" in opts and "changes" in out:
+                      with open(opts["--report"], "w", encoding="utf-8") as f:
+                          f.write(report(out["changes"], policy=out.get("policy"), plan=out.get("plan")))
+                  if "--events" in opts and "changes" in out:
+                      ev = events(out["changes"], out["made"])
+                      if ev:
+                          with open(opts["--events"], "w", encoding="utf-8") as f:
+                              f.write("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in ev))
+                          if "--record" in opts:
+                              record(opts["--record"], ev)
+              with open(target, "w", encoding="utf-8") as f:
+                  json.dump(out, f, indent=1)
+              print(f"Read {len(out['files'])} files: {len(out['deps'])} packages and images, {len(out['regions'])} cloud "
+                    f"regions, {len(out['models'])} model names, {len(out['signals'])} answers the code supports"
+                    + (f", {len(out['agent_access'])} agent tools" if out["agent_access"] else "") + (f", {len(out['audit'])} audit findings" if do_audit else "")
+                    + (f", {len(out['changes']['items'])} changes since {out['changes']['since'] or 'the last scan'}" if "changes" in out else "")
+                    + f". Wrote {target}. Open it and check it before you share it.")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PULSE_SCAN
+          cat > "$RUNNER_TEMP/layers.json" <<'PULSE_LAYERS'
+          {
+          "pypi:openai": "AI models",
+          "npm:openai": "AI models",
+          "pypi:anthropic": "AI models",
+          "npm:@anthropic-ai/sdk": "AI models",
+          "pypi:google-genai": "AI models",
+          "pypi:google-generativeai": "AI models",
+          "npm:@google/genai": "AI models",
+          "npm:@google/generative-ai": "AI models",
+          "pypi:google-cloud-aiplatform": "AI models",
+          "pypi:vertexai": "AI models",
+          "npm:@google-cloud/vertexai": "AI models",
+          "pypi:azure-ai-inference": "AI models",
+          "pypi:azure-ai-projects": "AI models",
+          "npm:@azure/openai": "AI models",
+          "npm:@azure-rest/ai-inference": "AI models",
+          "npm:@aws-sdk/client-bedrock-runtime": "AI models",
+          "npm:@aws-sdk/client-bedrock": "AI models",
+          "pypi:mistralai": "AI models",
+          "npm:@mistralai/mistralai": "AI models",
+          "pypi:cohere": "AI models",
+          "npm:cohere-ai": "AI models",
+          "pypi:transformers": "AI models",
+          "npm:@huggingface/transformers": "AI models",
+          "pypi:vllm": "AI models",
+          "docker:vllm/vllm-openai": "AI models",
+          "pypi:ollama": "AI models",
+          "npm:ollama": "AI models",
+          "docker:ollama/ollama": "AI models",
+          "pypi:llama-cpp-python": "AI models",
+          "pypi:torch": "Machine learning",
+          "pypi:torchvision": "Machine learning",
+          "docker:pytorch/pytorch": "Machine learning",
+          "pypi:tensorflow": "Machine learning",
+          "pypi:tensorflow-cpu": "Machine learning",
+          "pypi:tensorflow-gpu": "Machine learning",
+          "npm:@tensorflow/tfjs": "Machine learning",
+          "docker:tensorflow/tensorflow": "Machine learning",
+          "pypi:keras": "Machine learning",
+          "pypi:scikit-learn": "Machine learning",
+          "pypi:sklearn": "Machine learning",
+          "pypi:xgboost": "Machine learning",
+          "pypi:lightgbm": "Machine learning",
+          "pypi:catboost": "Machine learning",
+          "pypi:dgl": "Machine learning",
+          "pypi:dgl-*": "Machine learning",
+          "pypi:torch-geometric": "Machine learning",
+          "pypi:torch_geometric": "Machine learning",
+          "pypi:apache-flink": "Machine learning",
+          "docker:flink": "Machine learning",
+          "pypi:langchain": "AI frameworks",
+          "pypi:langchain-*": "AI frameworks",
+          "pypi:langgraph": "AI frameworks",
+          "npm:langchain": "AI frameworks",
+          "npm:@langchain/*": "AI frameworks",
+          "pypi:llama-index": "AI frameworks",
+          "pypi:llama-index-*": "AI frameworks",
+          "npm:llamaindex": "AI frameworks",
+          "pypi:haystack-ai": "AI frameworks",
+          "pypi:farm-haystack": "AI frameworks",
+          "pypi:semantic-kernel": "AI frameworks",
+          "pypi:autogen-agentchat": "AI frameworks",
+          "pypi:pyautogen": "AI frameworks",
+          "npm:ai": "AI frameworks",
+          "pypi:dspy": "AI frameworks",
+          "pypi:dspy-ai": "AI frameworks",
+          "pypi:crewai": "AI frameworks",
+          "pypi:pgvector": "Search and vector stores",
+          "npm:pgvector": "Search and vector stores",
+          "docker:pgvector/pgvector": "Search and vector stores",
+          "docker:ankane/pgvector": "Search and vector stores",
+          "pypi:opensearch-py": "Search and vector stores",
+          "npm:@opensearch-project/opensearch": "Search and vector stores",
+          "docker:opensearchproject/opensearch": "Search and vector stores",
+          "pypi:azure-search-documents": "Search and vector stores",
+          "npm:@azure/search-documents": "Search and vector stores",
+          "pypi:elasticsearch": "Search and vector stores",
+          "npm:@elastic/elasticsearch": "Search and vector stores",
+          "docker:elasticsearch": "Search and vector stores",
+          "docker:docker.elastic.co/elasticsearch/elasticsearch": "Search and vector stores",
+          "pypi:qdrant-client": "Search and vector stores",
+          "npm:@qdrant/js-client-rest": "Search and vector stores",
+          "docker:qdrant/qdrant": "Search and vector stores",
+          "pypi:weaviate-client": "Search and vector stores",
+          "npm:weaviate-client": "Search and vector stores",
+          "npm:weaviate-ts-client": "Search and vector stores",
+          "docker:semitechnologies/weaviate": "Search and vector stores",
+          "docker:cr.weaviate.io/semitechnologies/weaviate": "Search and vector stores",
+          "pypi:chromadb": "Search and vector stores",
+          "npm:chromadb": "Search and vector stores",
+          "docker:chromadb/chroma": "Search and vector stores",
+          "pypi:pinecone": "Search and vector stores",
+          "pypi:pinecone-client": "Search and vector stores",
+          "npm:@pinecone-database/pinecone": "Search and vector stores",
+          "pypi:faiss-cpu": "Search and vector stores",
+          "pypi:faiss-gpu": "Search and vector stores",
+          "pypi:opentelemetry-sdk": "Logs and monitoring",
+          "pypi:opentelemetry-api": "Logs and monitoring",
+          "npm:@opentelemetry/*": "Logs and monitoring",
+          "pypi:langfuse": "Logs and monitoring",
+          "npm:langfuse": "Logs and monitoring",
+          "npm:@langfuse/*": "Logs and monitoring",
+          "docker:langfuse/langfuse": "Logs and monitoring",
+          "pypi:mlflow": "Logs and monitoring",
+          "pypi:mlflow-skinny": "Logs and monitoring",
+          "pypi:arize-phoenix": "Logs and monitoring",
+          "pypi:openinference-*": "Logs and monitoring",
+          "pypi:langsmith": "Logs and monitoring",
+          "npm:langsmith": "Logs and monitoring",
+          "pypi:ddtrace": "Logs and monitoring",
+          "pypi:datadog": "Logs and monitoring",
+          "npm:dd-trace": "Logs and monitoring",
+          "pypi:sentry-sdk": "Logs and monitoring",
+          "npm:@sentry/*": "Logs and monitoring",
+          "pypi:presidio-analyzer": "Checks on AI output",
+          "pypi:presidio-anonymizer": "Checks on AI output",
+          "docker:mcr.microsoft.com/presidio-*": "Checks on AI output",
+          "docker:ghcr.io/data-privacy-stack/presidio-*": "Checks on AI output",
+          "pypi:guardrails-ai": "Checks on AI output",
+          "pypi:nemoguardrails": "Checks on AI output",
+          "pypi:llm-guard": "Checks on AI output",
+          "pypi:psycopg": "Databases",
+          "pypi:psycopg2": "Databases",
+          "pypi:psycopg2-binary": "Databases",
+          "pypi:asyncpg": "Databases",
+          "npm:pg": "Databases",
+          "npm:postgres": "Databases",
+          "docker:postgres": "Databases",
+          "pypi:mysqlclient": "Databases",
+          "pypi:pymysql": "Databases",
+          "pypi:mysql-connector-python": "Databases",
+          "npm:mysql2": "Databases",
+          "npm:mysql": "Databases",
+          "docker:mysql": "Databases",
+          "pypi:pymongo": "Databases",
+          "pypi:motor": "Databases",
+          "npm:mongodb": "Databases",
+          "npm:mongoose": "Databases",
+          "docker:mongo": "Databases",
+          "pypi:redis": "Databases",
+          "npm:redis": "Databases",
+          "npm:ioredis": "Databases",
+          "docker:redis": "Databases",
+          "pypi:snowflake-connector-python": "Databases",
+          "pypi:snowflake-snowpark-python": "Databases",
+          "npm:snowflake-sdk": "Databases",
+          "pypi:databricks-sdk": "Databases",
+          "pypi:databricks-sql-connector": "Databases",
+          "pypi:google-cloud-bigquery": "Databases",
+          "npm:@google-cloud/bigquery": "Databases",
+          "pypi:boto3": "Cloud",
+          "pypi:botocore": "Cloud",
+          "npm:@aws-sdk/*": "Cloud",
+          "npm:aws-sdk": "Cloud",
+          "tf:aws": "Cloud",
+          "pypi:azure-*": "Cloud",
+          "npm:@azure/*": "Cloud",
+          "tf:azurerm": "Cloud",
+          "pypi:google-cloud-*": "Cloud",
+          "npm:@google-cloud/*": "Cloud",
+          "tf:google": "Cloud"
+          }
+          PULSE_LAYERS
+          POLICY=.github/pulse-policy.json
+          PLAN=.github/compass-plan.json
+          RECORD=""
+          if [ -n "$PULSE_BASE" ]; then
+            git fetch -q --depth=1 origin "$PULSE_BASE"
+            git worktree add -q --detach "$RUNNER_TEMP/base" FETCH_HEAD
+            python3 "$RUNNER_TEMP/stack_scan.py" "$RUNNER_TEMP/base" --out "$RUNNER_TEMP/last.json"
+            POLICY="$RUNNER_TEMP/base/.github/pulse-policy.json"  # the base branch's policy: a pull request can't loosen its own check
+            PLAN="$RUNNER_TEMP/base/.github/compass-plan.json"  # the plan as merged: a pull request is read against the plan it would change
+          else
+            RECORD="$RUNNER_TEMP/record.jsonl"  # the Monday scan adds its changes to the record; a pull request does not
+            if git fetch -q --depth=1 origin pulse-stack 2>/dev/null; then
+              git show FETCH_HEAD:stack.json > "$RUNNER_TEMP/last.json" || true
+              git show FETCH_HEAD:record.jsonl > "$RECORD" 2>/dev/null || rm -f "$RECORD"
+            fi
+          fi
+          python3 "$RUNNER_TEMP/stack_scan.py" . --out "$RUNNER_TEMP/stack.json" --since "$RUNNER_TEMP/last.json"             --layers "$RUNNER_TEMP/layers.json" --report "$RUNNER_TEMP/change.md" --events "$RUNNER_TEMP/changes.jsonl" --policy "$POLICY" --plan "$PLAN"             ${RECORD:+--record "$RECORD"}
+          if [ -f "$RUNNER_TEMP/change.md" ] && [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            cat "$RUNNER_TEMP/change.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Keep the scan on the pulse-stack branch
+        if: github.event_name != 'pull_request'
+        run: |
+          # on top of the branch as it is, so its history and any lines your team committed to record.jsonl are kept
+          if git fetch -q --depth=1 origin pulse-stack 2>/dev/null; then
+            git checkout -q -f --detach FETCH_HEAD
+          else
+            git checkout -q --orphan pulse-stack
+            git rm -rq --cached .
+          fi
+          cp "$RUNNER_TEMP/stack.json" stack.json
+          git add stack.json
+          if [ -f "$RUNNER_TEMP/changes.jsonl" ]; then cp "$RUNNER_TEMP/changes.jsonl" changes.jsonl; git add changes.jsonl; fi
+          if [ -f "$RUNNER_TEMP/record.jsonl" ]; then cp "$RUNNER_TEMP/record.jsonl" record.jsonl; git add record.jsonl; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qm "Stack scan of $(date -u +%F)"
+          git push -q origin HEAD:refs/heads/pulse-stack
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULSE_PR: ${{ github.event.pull_request.number }}
+          PULSE_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PULSE_POST'
+          import json, os, sys, urllib.request
+          api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          url = api + "/repos/" + os.environ["PULSE_REPO"] + "/issues/" + os.environ["PULSE_PR"] + "/comments"
+          head = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "pulse-stack-scan"}
+          tmp = os.environ["RUNNER_TEMP"]
+          try:
+              body = open(os.path.join(tmp, "change.md"), encoding="utf-8").read()
+              st = json.load(open(os.path.join(tmp, "stack.json"), encoding="utf-8"))
+              ch = st["changes"]
+          except (OSError, ValueError, KeyError):
+              sys.exit(0)
+          changed = bool(ch["items"] or ch["other"]["added"] or ch["other"]["removed"] or (st.get("policy") or {}).get("fail")
+                         or (st.get("plan") or {}).get("new"))
+          def call(method, u, data=None):
+              req = urllib.request.Request(u, method=method, headers=head,
+                                           data=None if data is None else json.dumps({"body": data}).encode())
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+          try:
+              ours = None
+              for page in range(1, 6):
+                  got = call("GET", url + "?per_page=100&page=" + str(page))
+                  ours = next((c for c in got if "<!-- pulse-stack -->" in (c.get("body") or "")
+                               and (c.get("user") or {}).get("type") == "Bot"), ours)
+                  if len(got) < 100:
+                      break
+              if ours:
+                  call("PATCH", ours["url"], body)
+              elif changed:
+                  call("POST", url, body)
+          except Exception as e:
+              print("No comment left (" + str(e) + "); the change is in this run's summary.")
+          PULSE_POST
+      - name: Open an issue when the Monday scan finds a change
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULSE_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PULSE_ISSUE'
+          import json, os, sys, urllib.request
+          api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repo = api + "/repos/" + os.environ["PULSE_REPO"]
+          head = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "pulse-stack-scan"}
+          tmp = os.environ["RUNNER_TEMP"]
+          try:
+              body = open(os.path.join(tmp, "change.md"), encoding="utf-8").read()
+              st = json.load(open(os.path.join(tmp, "stack.json"), encoding="utf-8"))
+              ch = st["changes"]
+          except (OSError, ValueError, KeyError):
+              sys.exit(0)
+          hard = [h for h in (st.get("policy") or {}).get("hits", []) if h["level"] == "block"]
+          if not (ch["items"] or ch["other"]["added"] or ch["other"]["removed"] or hard):
+              sys.exit(0)
+          def call(method, u, data=None):
+              req = urllib.request.Request(u, method=method, headers=head, data=None if data is None else json.dumps(data).encode())
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+          try:
+              open_ = call("GET", repo + "/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100")
+              ours = next((i for i in open_ if "<!-- pulse-stack -->" in (i.get("body") or "") and "pull_request" not in i), None)
+              if ours:
+                  call("POST", ours["url"] + "/comments", {"body": body})
+              else:
+                  call("POST", repo + "/issues", {"title": "Pulse Pro Engine: stack change in the scan of " + st["made"], "body": body})
+          except Exception as e:
+              print("No issue opened (" + str(e) + "); the change is in this run's summary.")
+          PULSE_ISSUE
+      - name: Apply the policy file
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 - <<'PULSE_GATE'
+          import json, os, sys
+          p = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "stack.json"), encoding="utf-8")).get("policy") or {}
+          hard = [h for h in p.get("hits", []) if h["level"] == "block"]
+          for h in hard:
+              print(h["name"] + ": " + h["say"] + " (" + h["file"] + ")")
+          if p.get("fail"):
+              print("The policy file is set to block, so this check fails. Its table is in the pull request comment.")
+              sys.exit(1)
+          PULSE_GATE
