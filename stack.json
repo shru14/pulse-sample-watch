@@ -1,0 +1,166 @@
+{
+ "tool": "pulse-stack-scan",
+ "version": "1",
+ "made": "2026-11-22",
+ "deps": [
+  {
+   "eco": "docker",
+   "name": "python",
+   "ver": "",
+   "file": "Dockerfile",
+   "line": 1
+  },
+  {
+   "eco": "pypi",
+   "name": "fastapi",
+   "ver": "0.115.0",
+   "file": "requirements.txt",
+   "line": 2
+  },
+  {
+   "eco": "pypi",
+   "name": "uvicorn",
+   "ver": "0.30.6",
+   "file": "requirements.txt",
+   "line": 3
+  },
+  {
+   "eco": "pypi",
+   "name": "pydantic",
+   "ver": "2.9.2",
+   "file": "requirements.txt",
+   "line": 4
+  },
+  {
+   "eco": "pypi",
+   "name": "sqlalchemy",
+   "ver": "2.0.35",
+   "file": "requirements.txt",
+   "line": 5
+  },
+  {
+   "eco": "pypi",
+   "name": "psycopg",
+   "ver": "3.2.3",
+   "file": "requirements.txt",
+   "line": 6
+  },
+  {
+   "eco": "pypi",
+   "name": "openai",
+   "ver": "1.52.0",
+   "file": "requirements.txt",
+   "line": 7
+  },
+  {
+   "eco": "pypi",
+   "name": "anthropic",
+   "ver": "0.39.0",
+   "file": "requirements.txt",
+   "line": 8
+  },
+  {
+   "eco": "pypi",
+   "name": "mistralai",
+   "ver": "1.2.3",
+   "file": "requirements.txt",
+   "line": 9
+  },
+  {
+   "eco": "pypi",
+   "name": "google-genai",
+   "ver": "0.3.0",
+   "file": "requirements.txt",
+   "line": 10
+  },
+  {
+   "eco": "pypi",
+   "name": "azure-search-documents",
+   "ver": "11.5.1",
+   "file": "requirements.txt",
+   "line": 11
+  },
+  {
+   "eco": "pypi",
+   "name": "azure-identity",
+   "ver": "1.18.0",
+   "file": "requirements.txt",
+   "line": 12
+  },
+  {
+   "eco": "pypi",
+   "name": "langfuse",
+   "ver": "2.53.3",
+   "file": "requirements.txt",
+   "line": 13
+  },
+  {
+   "eco": "pypi",
+   "name": "pytest",
+   "ver": "8.3.3",
+   "file": "requirements.txt",
+   "line": 14
+  },
+  {
+   "eco": "tf",
+   "name": "azurerm",
+   "ver": "",
+   "file": "infra/main.tf",
+   "line": 3
+  },
+  {
+   "eco": "tf",
+   "name": "azurerm",
+   "ver": "",
+   "file": "infra/main.tf",
+   "line": 7
+  }
+ ],
+ "regions": [
+  {
+   "r": "westeurope",
+   "file": "infra/main.tf",
+   "line": 13
+  },
+  {
+   "r": "westeurope",
+   "file": "infra/main.tf",
+   "line": 27
+  }
+ ],
+ "models": [
+  {
+   "m": "gpt-5-mini",
+   "file": "app/followup.py",
+   "line": 4
+  },
+  {
+   "m": "gemini-embedding-001",
+   "file": "app/search.py",
+   "line": 4
+  },
+  {
+   "m": "claude-sonnet-4-5-20250929",
+   "file": "app/summary.py",
+   "line": 4
+  },
+  {
+   "m": "mistral-large-2512",
+   "file": "app/summary.py",
+   "line": 5
+  },
+  {
+   "m": "gpt-4o-transcribe",
+   "file": "app/transcribe.py",
+   "line": 4
+  }
+ ],
+ "audit": [],
+ "files": [
+  "Dockerfile",
+  "requirements.txt",
+  "infra/main.tf"
+ ],
+ "agent_access": [],
+ "signals": []
+}
