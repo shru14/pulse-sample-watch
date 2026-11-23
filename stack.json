@@ -1,7 +1,7 @@
 {
  "tool": "pulse-stack-scan",
  "version": "1",
- "made": "2026-11-22",
+ "made": "2026-11-23",
  "deps": [
   {
    "eco": "docker",
@@ -162,5 +162,13 @@
   "infra/main.tf"
  ],
  "agent_access": [],
- "signals": []
+ "signals": [],
+ "changes": {
+  "since": "2026-11-22",
+  "items": [],
+  "other": {
+   "added": [],
+   "removed": []
+  }
+ }
 }
